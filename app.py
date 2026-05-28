@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 import requests
 import time
 import logging
-from urllib.parse import parse_qs, unquote
+import traceback
 
 app = Flask(__name__)
 
@@ -18,50 +18,29 @@ EXOTEL_ACCOUNT_SID  = "meesho10m"
 EXOTEL_API_KEY      = "b31874cadcc6bd508645586f004f91b8f584796b6a0e2cf2"
 EXOTEL_API_TOKEN    = "d3c47f486c82e184ead7f2f20b07c348d6aafa4882cf07fa"
 EXOTEL_SUBDOMAIN    = "api.in.exotel.com"
-EXOTEL_CALLER_ID    = "08044620216"
-YOUR_SERVER_URL     = "https://exotel-redial-mechanism.onrender.com"  # UPDATE THIS
+EXOTEL_CALLER_ID    = "08044620216"     # Caller ID shown to customer
+EXOTEL_DID_NUMBER   = "08044620216"     # DID mapped to Genesys flow — UPDATE if different
+YOUR_SERVER_URL     = "https://exotel-redial-mechanism.onrender.com"
 
 # ─── Genesys Configuration ────────────────────────────────────────────────────
 GENESYS_NUMBER      = "sip:trmum17668bd8e0426a4eaee1a18"
 
 # ─── Redial Configuration ─────────────────────────────────────────────────────
 MAX_RETRIES         = 3
-DROP_DURATION_LIMIT = 10    # seconds
-RETRY_WAIT_SECONDS  = 4     # wait before redialing
-
-
-# ─── Helper: Parse Raw Query String ───────────────────────────────────────────
-def parse_raw_params(req):
-    """
-    Parses raw query string to handle Legs[0][OnCallDuration]
-    type parameters that Flask cannot parse directly.
-    """
-    try:
-        # Get raw query string and decode it
-        raw = req.query_string.decode('utf-8')
-        logger.info(f"Raw Query String: {raw}")
-
-        # Parse into dict (handles URL encoded brackets)
-        parsed = parse_qs(raw, keep_blank_values=True)
-
-        # Flatten single-value lists
-        flat = {k: v[0] if len(v) == 1 else v for k, v in parsed.items()}
-
-        logger.info(f"Parsed Params: {flat}")
-        return flat
-
-    except Exception as e:
-        logger.error(f"Error parsing raw params: {str(e)}")
-        return {}
+DROP_DURATION_LIMIT = 10
+RETRY_WAIT_SECONDS  = 4
 
 
 # ─── Health Check ─────────────────────────────────────────────────────────────
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
-        "status"  : "Exotel Redial Service is Running",
-        "account" : EXOTEL_ACCOUNT_SID,
-        "genesys" : GENESYS_NUMBER
+        "status"        : "Exotel Redial Service is Running",
+        "account"       : EXOTEL_ACCOUNT_SID,
+        "did_number"    : EXOTEL_DID_NUMBER,
+        "genesys"       : GENESYS_NUMBER,
+        "max_retries"   : MAX_RETRIES,
+        "drop_limit"    : f"{DROP_DURATION_LIMIT} sec"
     })
 
 
@@ -69,24 +48,42 @@ def home():
 @app.route('/call-status', methods=['GET', 'POST'])
 def call_status():
     try:
-        # ── Parse all parameters safely ───────────────────────────────────────
-        params = parse_raw_params(request)
+        # ── Parse raw query string ────────────────────────────────────────────
+        from urllib.parse import unquote_plus
+        raw_qs = request.query_string.decode('utf-8')
+        logger.info(f"RAW QS : {raw_qs}")
 
-        # ── Extract standard call details ─────────────────────────────────────
-        dial_call_duration  = int(params.get('DialCallDuration', 0))
-        dial_call_status    = params.get('DialCallStatus', '').lower()
+        params = {}
+        if raw_qs:
+            for pair in raw_qs.split('&'):
+                if '=' in pair:
+                    k, v = pair.split('=', 1)
+                    k = unquote_plus(k)
+                    v = unquote_plus(v)
+                    params[k] = v
+
+        # ── Extract call details ──────────────────────────────────────────────
         call_sid            = params.get('CallSid', '')
         caller_number       = params.get('From', '')
         call_to             = params.get('To', '')
+        dial_call_status    = params.get('DialCallStatus', '').lower().strip()
+        dial_call_duration  = int(params.get('DialCallDuration', 0))
         call_type           = params.get('CallType', '')
         retry_count         = int(params.get('retry_count', 0))
 
-        # ── Extract Leg Details (URL decoded brackets) ────────────────────────
-        leg_number      = params.get('Legs[0][Number]', '')
-        leg_duration    = int(params.get('Legs[0][OnCallDuration]', 0))
-        leg_cause       = params.get('Legs[0][Cause]', '')
-        leg_cause_code  = params.get('Legs[0][CauseCode]', '')
-        disconnected_by = params.get('Legs[0][DisconnectedBy]', '')
+        # ── Extract Leg details ───────────────────────────────────────────────
+        leg_number          = params.get('Legs[0][Number]', '')
+        leg_duration_raw    = params.get('Legs[0][OnCallDuration]', '0')
+        leg_cause           = params.get('Legs[0][Cause]', '')
+        leg_cause_code      = params.get('Legs[0][CauseCode]', '')
+        disconnected_by     = params.get('Legs[0][DisconnectedBy]', '')
+
+        # ── Safe int conversion ───────────────────────────────────────────────
+        try:
+            leg_duration = int(leg_duration_raw)
+        except (ValueError, TypeError):
+            logger.warning(f"Could not parse leg_duration: '{leg_duration_raw}'")
+            leg_duration = 0
 
         # ── Log all details ───────────────────────────────────────────────────
         logger.info("=" * 60)
@@ -104,29 +101,30 @@ def call_status():
         logger.info(f"Retry Count        : {retry_count}")
         logger.info("=" * 60)
 
-        # ── Drop Detection Logic (0 to 10 seconds) ────────────────────────────
-        is_dropped = (
-            leg_duration <= DROP_DURATION_LIMIT and
-            dial_call_status in ['completed', 'no-answer', 'failed', 'busy']
-        )
+        # ── Drop detection (0 to 10 sec) ──────────────────────────────────────
+        duration_check  = leg_duration <= DROP_DURATION_LIMIT
+        status_check    = dial_call_status in [
+                            'completed', 'no-answer', 'failed', 'busy'
+                          ]
+        is_dropped      = duration_check and status_check
 
-        logger.info(f"Is Dropped? : {is_dropped}")
-        logger.info(f"Leg Duration ({leg_duration}s) <= Limit ({DROP_DURATION_LIMIT}s) : {leg_duration <= DROP_DURATION_LIMIT}")
-        logger.info(f"Status Match: {dial_call_status in ['completed', 'no-answer', 'failed', 'busy']}")
+        logger.info(f"Duration Check : {leg_duration}s <= {DROP_DURATION_LIMIT}s = {duration_check}")
+        logger.info(f"Status Check   : '{dial_call_status}' matched = {status_check}")
+        logger.info(f"Is Dropped     : {is_dropped}")
+        logger.info(f"Retries Left   : {MAX_RETRIES - retry_count}")
 
-        # ── Redial if dropped and retries remaining ───────────────────────────
+        # ── Redial ────────────────────────────────────────────────────────────
         if is_dropped and retry_count < MAX_RETRIES:
             retry_count += 1
-
-            logger.warning(f"⚠️  Call dropped! Leg Duration : {leg_duration}s")
+            logger.warning(f"⚠️  DROP DETECTED!")
+            logger.warning(f"    Caller          : {caller_number}")
+            logger.warning(f"    Leg Duration    : {leg_duration}s")
             logger.warning(f"    Disconnected By : {disconnected_by}")
             logger.warning(f"    Cause Code      : {leg_cause_code}")
-            logger.warning(f"🔄  Redial Attempt  : #{retry_count} of {MAX_RETRIES}")
+            logger.warning(f"🔄  Redialing via DID {EXOTEL_DID_NUMBER} — Attempt #{retry_count} of {MAX_RETRIES}")
 
-            # Wait before redialing
             time.sleep(RETRY_WAIT_SECONDS)
 
-            # Trigger redial
             success = trigger_redial(caller_number, retry_count)
 
             if success:
@@ -135,6 +133,8 @@ def call_status():
                     "status"        : "redial_triggered",
                     "attempt"       : retry_count,
                     "call_sid"      : call_sid,
+                    "caller"        : caller_number,
+                    "dialed_did"    : EXOTEL_DID_NUMBER,
                     "leg_duration"  : leg_duration,
                     "disconnected"  : disconnected_by
                 }), 200
@@ -147,9 +147,7 @@ def call_status():
 
         # ── Max retries reached ───────────────────────────────────────────────
         elif is_dropped and retry_count >= MAX_RETRIES:
-            logger.error(
-                f"🚫 Max retries ({MAX_RETRIES}) reached for {caller_number}"
-            )
+            logger.error(f"🚫 Max retries ({MAX_RETRIES}) reached for {caller_number}")
             return jsonify({
                 "status"         : "max_retries_reached",
                 "caller_number"  : caller_number,
@@ -157,13 +155,9 @@ def call_status():
                 "last_duration"  : leg_duration
             }), 200
 
-        # ── Normal call completed ─────────────────────────────────────────────
+        # ── Normal call ───────────────────────────────────────────────────────
         else:
-            logger.info(
-                f"✅ Normal call. "
-                f"Leg Duration: {leg_duration}s | "
-                f"Disconnected By: {disconnected_by}"
-            )
+            logger.info(f"✅ Normal call. Duration={leg_duration}s")
             return jsonify({
                 "status"          : "call_completed_normally",
                 "leg_duration"    : leg_duration,
@@ -173,14 +167,15 @@ def call_status():
             }), 200
 
     except Exception as e:
-        logger.error(f"❌ Error in call_status: {str(e)}")
-        # Log full traceback for debugging
-        import traceback
+        logger.error(f"❌ EXCEPTION:")
         logger.error(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
+        return jsonify({
+            "error" : str(e),
+            "trace" : traceback.format_exc()
+        }), 500
 
 
-# ─── Redial Function ──────────────────────────────────────────────────────────
+# ─── Redial via Exotel DID ────────────────────────────────────────────────────
 def trigger_redial(caller_number, retry_count):
     try:
         url = (
@@ -189,10 +184,14 @@ def trigger_redial(caller_number, retry_count):
             f"{EXOTEL_ACCOUNT_SID}/Calls/connect"
         )
 
+        # ── From = caller's number ─────────────────────────────────────────
+        # ── To   = Exotel DID mapped to Genesys flow ──────────────────────
+        # Exotel will ring the caller, and when answered,
+        # connect them through the DID flow to Genesys
         payload = {
-            'From'                : caller_number,
-            'To'                  : GENESYS_NUMBER,
-            'CallerId'            : EXOTEL_CALLER_ID,
+            'From'                : caller_number,      # 09790571549
+            'To'                  : EXOTEL_DID_NUMBER,  # 08044620216 → flow → Genesys
+            'CallerId'            : EXOTEL_CALLER_ID,   # Shown to caller
             'TimeLimit'           : 3600,
             'StatusCallback'      : (
                 f"{YOUR_SERVER_URL}/call-status"
@@ -202,24 +201,49 @@ def trigger_redial(caller_number, retry_count):
             'CustomField'         : f"redial_attempt_{retry_count}"
         }
 
-        logger.info(f"📞  Calling Exotel Redial API...")
-        logger.info(f"    From     : {caller_number}")
-        logger.info(f"    To       : {GENESYS_NUMBER}")
-        logger.info(f"    Attempt  : {retry_count}")
-        logger.info(f"    Callback : {payload['StatusCallback']}")
+        logger.info(f"📞  Redial via Exotel DID...")
+        logger.info(f"    Caller (From)   : {caller_number}")
+        logger.info(f"    DID (To)        : {EXOTEL_DID_NUMBER}")
+        logger.info(f"    CallerID        : {EXOTEL_CALLER_ID}")
+        logger.info(f"    Attempt         : #{retry_count}")
+        logger.info(f"    StatusCallback  : {payload['StatusCallback']}")
 
-        response = requests.post(url, data=payload)
+        response = requests.post(url, data=payload, timeout=10)
 
-        logger.info(f"    API Status : {response.status_code}")
-        logger.info(f"    API Body   : {response.text}")
+        logger.info(f"    API Status  : {response.status_code}")
+        logger.info(f"    API Body    : {response.text}")
 
         return response.status_code in [200, 201]
 
     except Exception as e:
-        logger.error(f"❌  Error in trigger_redial: {str(e)}")
-        import traceback
+        logger.error(f"❌  trigger_redial error:")
         logger.error(traceback.format_exc())
         return False
+
+
+# ─── Debug Endpoint ───────────────────────────────────────────────────────────
+@app.route('/debug', methods=['GET', 'POST'])
+def debug():
+    try:
+        from urllib.parse import unquote_plus
+        raw_qs = request.query_string.decode('utf-8')
+        params = {}
+        if raw_qs:
+            for pair in raw_qs.split('&'):
+                if '=' in pair:
+                    k, v = pair.split('=', 1)
+                    k = unquote_plus(k)
+                    v = unquote_plus(v)
+                    params[k] = v
+        return jsonify({
+            "raw_query_string"  : raw_qs,
+            "parsed_params"     : params,
+            "leg_duration"      : params.get('Legs[0][OnCallDuration]', 'NOT FOUND'),
+            "disconnected_by"   : params.get('Legs[0][DisconnectedBy]', 'NOT FOUND'),
+            "cause_code"        : params.get('Legs[0][CauseCode]', 'NOT FOUND'),
+        }), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ─── Config Check ─────────────────────────────────────────────────────────────
@@ -227,8 +251,9 @@ def trigger_redial(caller_number, retry_count):
 def get_config():
     return jsonify({
         "account_sid"    : EXOTEL_ACCOUNT_SID,
-        "genesys_number" : GENESYS_NUMBER,
+        "did_number"     : EXOTEL_DID_NUMBER,
         "caller_id"      : EXOTEL_CALLER_ID,
+        "genesys_number" : GENESYS_NUMBER,
         "max_retries"    : MAX_RETRIES,
         "drop_limit_sec" : DROP_DURATION_LIMIT,
         "retry_wait_sec" : RETRY_WAIT_SECONDS,
