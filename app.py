@@ -233,6 +233,9 @@ def trigger_redial(caller_number, retry_count):
             ),
             'StatusCallbackEvent' : 'terminal',
             'CustomField'         : f"redial_attempt_{retry_count}"
+            'CallType'            : 'trans',
+            'CallerId'            : EXOTEL_CALLER_ID,
+            'Url'                 : f"http://my.exotel.com/meesho10m/exoml/start_voice/{43561}"
         }
 
         logger.info(f"📞  Redial...")
