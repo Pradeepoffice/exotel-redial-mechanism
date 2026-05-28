@@ -223,8 +223,8 @@ def trigger_redial(caller_number, retry_count):
         )
 
         payload = {
-            'From'                : EXOTEL_DID_NUMBER,
-            'To'                  : caller_number,
+            'From'                : caller_number,
+            'To'                  : EXOTEL_DID_NUMBER,
             'CallerId'            : EXOTEL_CALLER_ID,
             'TimeLimit'           : 3600,
             'StatusCallback'      : (
