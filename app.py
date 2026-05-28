@@ -17,8 +17,8 @@ EXOTEL_ACCOUNT_SID  = "meesho10m"
 EXOTEL_API_KEY      = "b31874cadcc6bd508645586f004f91b8f584796b6a0e2cf2"
 EXOTEL_API_TOKEN    = "d3c47f486c82e184ead7f2f20b07c348d6aafa4882cf07fa"
 EXOTEL_SUBDOMAIN    = "api.in.exotel.com"
-EXOTEL_CALLER_ID    = "918044319050"          # UPDATE THIS
-YOUR_SERVER_URL     = "https://your-render-app.onrender.com"  # UPDATE AFTER DEPLOY
+EXOTEL_CALLER_ID    = "918045695122"          # UPDATE THIS
+YOUR_SERVER_URL     = "https://exotel-redial-mechanism.onrender.com"  # UPDATE AFTER DEPLOY
 
 # ─── Genesys Configuration ────────────────────────────────────────────────────
 GENESYS_NUMBER      = "sip:trmum1ba17debad89d12e25f1a4e"
